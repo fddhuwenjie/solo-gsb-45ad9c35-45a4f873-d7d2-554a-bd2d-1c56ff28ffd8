@@ -17,6 +17,13 @@ class UnprocessableError(DomainError):
     code = "validation_error"
 
 
+class WindowAuditError(DomainError):
+    """按日期窗口送审未通过：整批修订已回滚。"""
+
+    status_code = 422
+    code = "window_audit_failed"
+
+
 class ConflictError(DomainError):
     status_code = 409
     code = "request_id_conflict"

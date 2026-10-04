@@ -5,9 +5,11 @@ import datetime as dt
 import hashlib
 import json
 from collections import defaultdict
+from typing import Callable
 
+from .audit import run_audit
 from .db import Database
-from .errors import ConflictError, UnprocessableError
+from .errors import ConflictError, UnprocessableError, WindowAuditError
 from .models import ApplicationIn
 
 
@@ -28,7 +30,29 @@ def submit_revisions(db: Database, payload: ApplicationIn) -> tuple[dict, int, b
     - request_id 已存在但负载不同：409。
     - 任何校验失败：整体回滚，不写入部分数据。
     """
-    endpoint = "POST /applications"
+    return _submit(db, "POST /applications", payload, tentative_check=None)
+
+
+def submit_revisions_windowed(db: Database, payload) -> tuple[dict, int, bool]:
+    """按日期窗口送审后再提交一批修订（全有或全无）。
+
+    - 整批修订（含开放版本自动封闭）先在事务内暂时应用（未提交）；
+    - 按窗口内所有权利要求的生效/失效边界划段，用现有 /audit 规则审查每段起日；
+    - 每段都存在有效权利要求且审查通过，才提交修订与 request_id；
+    - 任一段为空或审查不通过：回滚整批修改（含 request_id），返回最早失败日期与原因。
+    """
+    return _submit(
+        db, "POST /applications/audited-submissions", payload,
+        tentative_check=lambda submission: _audit_window(db, payload, submission),
+    )
+
+
+def _submit(
+    db: Database,
+    endpoint: str,
+    payload: ApplicationIn,
+    tentative_check: Callable[[dict], dict] | None,
+) -> tuple[dict, int, bool]:
     body = payload.model_dump(mode="json")
     digest = _payload_hash(endpoint, body)
 
@@ -47,7 +71,10 @@ def submit_revisions(db: Database, payload: ApplicationIn) -> tuple[dict, int, b
 
         db.conn.execute("BEGIN IMMEDIATE")
         try:
-            response = _apply_revisions(db, payload)
+            submission = _apply_revisions(db, payload)
+            response = (
+                tentative_check(submission) if tentative_check is not None else submission
+            )
             status_code = 201
             db.conn.execute(
                 "INSERT INTO requests (request_id, endpoint, payload_hash, status_code, response_body, created_at)"
@@ -60,6 +87,79 @@ def submit_revisions(db: Database, payload: ApplicationIn) -> tuple[dict, int, b
             db.conn.execute("ROLLBACK")
             raise
         return response, status_code, False
+
+
+def _segment_boundaries(conn, application_number: str,
+                        start: dt.date, end: dt.date) -> list[dt.date]:
+    """收集窗口 [start, end) 内所有版本的生效/失效边界（含窗口起日），去重排序。
+
+    边界取自「暂时应用后」的全部修订行；落在窗口外的边界裁剪掉，
+    止日 end 作为半开区间端点不构成任何段的起日。
+    """
+    rows = conn.execute(
+        "SELECT effective_from, effective_to FROM revisions WHERE application_number = ?",
+        (application_number,),
+    ).fetchall()
+    boundaries = {start}
+    for r in rows:
+        for raw in (r["effective_from"], r["effective_to"]):
+            if raw is None:
+                continue
+            d = dt.date.fromisoformat(raw)
+            if start <= d < end:
+                boundaries.add(d)
+    return sorted(boundaries)
+
+
+def _audit_window(db: Database, payload, submission: dict) -> dict:
+    """修订已在当前事务内暂时应用（未提交）：按窗口划段审查每段起日。
+
+    任一段为空或审查不通过即抛 WindowAuditError，由调用方回滚整批修改；
+    全部通过则返回窗口提交响应（含各段审查日期与提交结果）。
+    """
+    start = payload.start_date
+    end = payload.end_date
+    boundaries = _segment_boundaries(db.conn, payload.application_number, start, end)
+    audit_dates = [d.isoformat() for d in boundaries]
+    segments: list[dict] = []
+    for audit_date in boundaries:
+        # run_audit 读同一连接，看到的是未提交的暂时应用状态
+        result = run_audit(db, payload.application_number, audit_date)
+        effective = result["effective_claims"]
+        if not effective:
+            raise WindowAuditError(
+                "日期窗口内存在没有任何有效权利要求的段落",
+                details={
+                    "failed_date": audit_date.isoformat(),
+                    "reason": "该段起日没有任何有效权利要求",
+                    "segment_audit_dates": audit_dates,
+                },
+            )
+        if result["issues"]:
+            raise WindowAuditError(
+                f"{audit_date.isoformat()} 起日的权利要求依附审查未通过",
+                details={
+                    "failed_date": audit_date.isoformat(),
+                    "reason": "审查不通过：" + "; ".join(i["message"] for i in result["issues"]),
+                    "issues": result["issues"],
+                    "segment_audit_dates": audit_dates,
+                },
+            )
+        segments.append({
+            "audit_date": audit_date.isoformat(),
+            "status": result["status"],
+            "effective_claim_count": len(effective),
+            "issues": result["issues"],
+        })
+
+    return {
+        "request_id": payload.request_id,
+        "application_number": payload.application_number,
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "segments": segments,
+        "submission": submission,
+    }
 
 
 def _apply_revisions(db: Database, payload: ApplicationIn) -> dict:

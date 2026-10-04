@@ -75,6 +75,40 @@ class ApplicationResponse(BaseModel):
     auto_closed: list[AutoClosed]
 
 
+class WindowedApplicationIn(ApplicationIn):
+    """POST /applications/audited-submissions 请求体。
+
+    在 /applications 字段之外增加半开审查区间 [start_date, end_date)。
+    """
+
+    start_date: dt.date = Field(description="审查窗口起日（含当日）")
+    end_date: dt.date = Field(description="审查窗口止日（不含当日）")
+
+    @model_validator(mode="after")
+    def _check_window(self) -> "WindowedApplicationIn":
+        if self.start_date >= self.end_date:
+            raise ValueError("start_date 必须早于 end_date（半开区间 [start_date, end_date)）")
+        return self
+
+
+class SegmentAudit(BaseModel):
+    """一个边界划段在其起日上的审查结果。"""
+
+    audit_date: dt.date
+    status: str  # "pass" | "fail"
+    effective_claim_count: int
+    issues: list[Issue]
+
+
+class WindowedApplicationResponse(BaseModel):
+    request_id: str
+    application_number: str
+    start_date: dt.date
+    end_date: dt.date
+    segments: list[SegmentAudit] = Field(description="按时间顺序的各段起日审查结果（全部通过）")
+    submission: ApplicationResponse = Field(description="一次性保存的修订提交结果")
+
+
 class AuditIn(BaseModel):
     """POST /audit 请求体。"""
 

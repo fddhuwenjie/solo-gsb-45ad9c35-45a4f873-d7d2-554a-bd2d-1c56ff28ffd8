@@ -17,8 +17,10 @@ from .models import (
     AuditResponse,
     EvidenceCreatedResponse,
     EvidenceResponse,
+    WindowedApplicationIn,
+    WindowedApplicationResponse,
 )
-from .store import get_application, submit_revisions
+from .store import get_application, submit_revisions, submit_revisions_windowed
 
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "./data/app.db")
 
@@ -46,6 +48,28 @@ def create_app(db_path: str = DATABASE_PATH) -> FastAPI:
     def post_applications(payload: ApplicationIn, request: Request):
         """提交申请号及一批权利要求修订（幂等，事务性）。"""
         response, status_code, replayed = submit_revisions(request.app.state.db, payload)
+        return JSONResponse(
+            status_code=status_code,
+            content=response,
+            headers={"X-Idempotent-Replay": "true" if replayed else "false"},
+        )
+
+    @app.post(
+        "/applications/audited-submissions",
+        status_code=201,
+        response_model=WindowedApplicationResponse,
+    )
+    def post_applications_windowed(payload: WindowedApplicationIn, request: Request):
+        """按日期窗口送审通过后一次性提交修订（幂等，全有或全无）。
+
+        整批修订（含开放版本自动封闭）先暂时应用，按半开区间
+        [start_date, end_date) 内的生效/失效边界划段，逐段起日执行
+        与 /audit 相同的审查；每段都有有效权利要求且全部通过才落库，
+        否则整批回滚并返回最早失败日期与原因。
+        """
+        response, status_code, replayed = submit_revisions_windowed(
+            request.app.state.db, payload
+        )
         return JSONResponse(
             status_code=status_code,
             content=response,
