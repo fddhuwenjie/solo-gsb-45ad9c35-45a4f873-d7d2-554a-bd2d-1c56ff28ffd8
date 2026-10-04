@@ -62,6 +62,19 @@ class ApplicationIn(BaseModel):
     revisions: list[RevisionIn] = Field(min_length=1, description="本次提交的权利要求修订")
 
 
+class WindowSubmissionIn(ApplicationIn):
+    """POST /applications/window-audit 请求体：修订字段同 /applications，另带半开审查区间。"""
+
+    start_date: dt.date = Field(description="审查窗口起日（含当日）")
+    end_date: dt.date = Field(description="审查窗口止日（不含当日），必须晚于起日")
+
+    @model_validator(mode="after")
+    def _check_window(self) -> "WindowSubmissionIn":
+        if self.start_date >= self.end_date:
+            raise ValueError("end_date 必须晚于 start_date（半开区间 [start_date, end_date)）")
+        return self
+
+
 class AutoClosed(BaseModel):
     claim_number: int
     closed_version: int
@@ -73,6 +86,22 @@ class ApplicationResponse(BaseModel):
     application_number: str
     stored_revisions: int
     auto_closed: list[AutoClosed]
+
+
+class WindowAuditSegment(BaseModel):
+    audit_date: dt.date
+    effective_claims: int
+    status: str  # "pass"
+
+
+class WindowAuditResponse(BaseModel):
+    request_id: str
+    application_number: str
+    start_date: dt.date
+    end_date: dt.date
+    stored_revisions: int
+    auto_closed: list[AutoClosed]
+    segments: list[WindowAuditSegment]
 
 
 class AuditIn(BaseModel):

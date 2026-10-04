@@ -5,6 +5,7 @@ import datetime as dt
 import hashlib
 import json
 from collections import defaultdict
+from typing import Callable
 
 from .db import Database
 from .errors import ConflictError, UnprocessableError
@@ -20,39 +21,45 @@ def _payload_hash(endpoint: str, payload: dict) -> str:
     return hashlib.sha256(f"{endpoint}\n{canonical}".encode("utf-8")).hexdigest()
 
 
-def submit_revisions(db: Database, payload: ApplicationIn) -> tuple[dict, int, bool]:
-    """提交一批修订。
+def idempotent_transaction(
+    db: Database,
+    request_id: str,
+    endpoint: str,
+    body: dict,
+    perform: Callable[[Database], dict],
+    status_code: int = 201,
+) -> tuple[dict, int, bool]:
+    """带 request_id 幂等保护的单事务写入。
 
-    返回 (响应体, 状态码, 是否幂等重放)。
     - request_id 已存在且负载一致：返回首次存储的响应（重放，不重复写入）。
-    - request_id 已存在但负载不同：409。
-    - 任何校验失败：整体回滚，不写入部分数据。
+    - request_id 已存在但负载不同：409（跨端点复用同一 request_id 同样视为冲突）。
+    - perform 抛出任何异常：整体回滚（含 request_id 记录），不落部分数据。
+
+    perform 在已开启的事务内执行，可以先做临时写入再读取校验；
+    只有正常返回才会提交。
     """
-    endpoint = "POST /applications"
-    body = payload.model_dump(mode="json")
     digest = _payload_hash(endpoint, body)
 
     with db._lock:
         row = db.conn.execute(
             "SELECT payload_hash, status_code, response_body FROM requests WHERE request_id = ?",
-            (payload.request_id,),
+            (request_id,),
         ).fetchone()
         if row is not None:
             if row["payload_hash"] != digest:
                 raise ConflictError(
-                    f"request_id '{payload.request_id}' 已使用且负载不一致",
-                    details={"request_id": payload.request_id},
+                    f"request_id '{request_id}' 已使用且负载不一致",
+                    details={"request_id": request_id},
                 )
             return json.loads(row["response_body"]), row["status_code"], True
 
         db.conn.execute("BEGIN IMMEDIATE")
         try:
-            response = _apply_revisions(db, payload)
-            status_code = 201
+            response = perform(db)
             db.conn.execute(
                 "INSERT INTO requests (request_id, endpoint, payload_hash, status_code, response_body, created_at)"
                 " VALUES (?, ?, ?, ?, ?, ?)",
-                (payload.request_id, endpoint, digest, status_code,
+                (request_id, endpoint, digest, status_code,
                  json.dumps(response, ensure_ascii=False), _utcnow()),
             )
             db.conn.execute("COMMIT")
@@ -62,7 +69,25 @@ def submit_revisions(db: Database, payload: ApplicationIn) -> tuple[dict, int, b
         return response, status_code, False
 
 
-def _apply_revisions(db: Database, payload: ApplicationIn) -> dict:
+def submit_revisions(db: Database, payload: ApplicationIn) -> tuple[dict, int, bool]:
+    """提交一批修订。
+
+    返回 (响应体, 状态码, 是否幂等重放)。
+    - request_id 重复且负载一致 → 返回首次响应（重放，不重复写入）。
+    - request_id 重复但负载不同 → 409。
+    - 任何校验失败：整体回滚，不写入部分数据。
+    """
+    body = payload.model_dump(mode="json")
+    return idempotent_transaction(
+        db,
+        request_id=payload.request_id,
+        endpoint="POST /applications",
+        body=body,
+        perform=lambda conn: apply_revisions(conn, payload),
+    )
+
+
+def apply_revisions(db: Database, payload: ApplicationIn) -> dict:
     conn = db.conn
     now = _utcnow()
     conn.execute(

@@ -54,6 +54,71 @@ pytest tests/ -q        # 运行测试
 - `request_id` 重复但负载不同 → `409`；
 - 任一条修订校验失败 → 整批回滚（`422`，附全部错误明细），**不写入部分数据**。
 
+### POST /applications/window-audit — 按日期窗口逐段送审后再提交
+
+在 `POST /applications` 的请求体（`request_id`、`application_number`、同一套 `revisions` 字段）
+之上**额外**给出半开区间审查窗口 `[start_date, end_date)`，`start_date` 必须严格早于 `end_date`：
+
+```bash
+curl -X POST http://localhost:8000/applications/window-audit \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "request_id": "req-window-001",
+    "application_number": "CN202610001",
+    "start_date": "2026-01-01",
+    "end_date": "2027-01-01",
+    "revisions": [
+      {"claim_number": 1, "version": 1, "claim_type": "independent",
+       "references": [], "text": "一种装置……",
+       "effective_from": "2026-01-01", "effective_to": "2026-06-01"},
+      {"claim_number": 1, "version": 2, "claim_type": "independent",
+       "references": [], "text": "一种改进装置……",
+       "effective_from": "2026-06-01", "effective_to": null},
+      {"claim_number": 2, "version": 1, "claim_type": "dependent",
+       "references": [1], "reference_mode": "all", "text": "如权利要求1所述……",
+       "effective_from": "2026-01-01", "effective_to": null}
+    ]
+  }'
+```
+
+处理流程（**全部在单个数据库事务内**）：
+
+1. 沿用 `/applications` 的全部规则把整批修订（含开放版本的**自动封闭**）**临时**写入事务；
+2. 收集窗口内所有权利要求版本的生效/失效边界，把 `[start_date, end_date)` 划成若干段——
+   段起日为 `start_date`，以及每个落在 `(start_date, end_date)` 内的边界日（`end_date` 本身不划段）；
+3. 用**现有 `/audit` 的同一套规则**审查每个段起日：该日必须**存在至少一个有效权利要求**且审查通过；
+4. **每段都非空且审查通过**，才一次性提交修订与 `request_id`；任一段为空或不通过，
+   整批修订及 `request_id` 全部回滚，旧数据与此前冻结的证据包不受影响。
+
+成功响应（`201`）给出各段审查日期与提交结果：
+
+```json
+{
+  "request_id": "req-window-001",
+  "application_number": "CN202610001",
+  "start_date": "2026-01-01",
+  "end_date": "2027-01-01",
+  "stored_revisions": 3,
+  "auto_closed": [],
+  "segments": [
+    {"audit_date": "2026-01-01", "effective_claims": 2, "status": "pass"},
+    {"audit_date": "2026-06-01", "effective_claims": 2, "status": "pass"}
+  ]
+}
+```
+
+任一失败返回 `422`（`error.code = window_audit_rejected`），`details` 给出
+**最早失败日期** `failed_date`、`reason`（`EMPTY_SEGMENT` / `AUDIT_FAILED`）
+及该日的完整 `/audit` 问题列表 `issues`；此时修订未保存，窗口内每一天都恢复为提交前的状态
+（临时自动封闭也一并撤销，旧开放版本依旧开放），旧证据包仍可照常 `GET /audit/evidence/{id}` 复验。
+
+**幂等与原端点行为**：
+
+- 同一 `request_id` 携带**相同请求**重试：返回首次成功结果（`X-Idempotent-Replay: true`）；
+- 同一 `request_id` **更换内容**（含窗口或任一字段）：`409`；`request_id` 在两个提交端点间共用；
+- 失败的尝试不占用 `request_id`，可修正后原样重试；
+- 原 `POST /applications` 行为完全不变（不做任何窗口审查）。
+
 ### POST /audit — 按目标日期审查
 
 ```json
@@ -194,11 +259,13 @@ app/
   main.py      # FastAPI 路由与异常映射
   models.py    # Pydantic 请求/响应模型（含提交期结构校验）
   store.py     # 写入路径：幂等 + 版本链校验 + 单事务
+  window.py    # 日期窗口送审提交：临时应用 → 边界划段 → 逐段 /audit → 一次提交或整体回滚
   audit.py     # 目标日重建、引用有效性、DFS 成环检测
   evidence.py  # 证据包：固定字段顺序冻结 UTF-8 JSON、SHA-256、库外密钥签发依据、只读复验/篡改报告
   db.py        # SQLite 连接与 schema（含 evidence_packages 快照表与就地迁移）
   errors.py    # 领域错误 → HTTP 状态码
 tests/test_api.py
 tests/test_evidence.py
+tests/test_window.py
 Dockerfile / docker-compose.yml / requirements.txt
 ```

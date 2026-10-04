@@ -17,8 +17,11 @@ from .models import (
     AuditResponse,
     EvidenceCreatedResponse,
     EvidenceResponse,
+    WindowAuditResponse,
+    WindowSubmissionIn,
 )
 from .store import get_application, submit_revisions
+from .window import submit_with_window_audit
 
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "./data/app.db")
 
@@ -46,6 +49,22 @@ def create_app(db_path: str = DATABASE_PATH) -> FastAPI:
     def post_applications(payload: ApplicationIn, request: Request):
         """提交申请号及一批权利要求修订（幂等，事务性）。"""
         response, status_code, replayed = submit_revisions(request.app.state.db, payload)
+        return JSONResponse(
+            status_code=status_code,
+            content=response,
+            headers={"X-Idempotent-Replay": "true" if replayed else "false"},
+        )
+
+    @app.post(
+        "/applications/window-audit",
+        status_code=201,
+        response_model=WindowAuditResponse,
+    )
+    def post_applications_window_audit(payload: WindowSubmissionIn, request: Request):
+        """按日期窗口分段送审，全部通过后一次性提交整批修订（幂等，事务性）。"""
+        response, status_code, replayed = submit_with_window_audit(
+            request.app.state.db, payload
+        )
         return JSONResponse(
             status_code=status_code,
             content=response,
